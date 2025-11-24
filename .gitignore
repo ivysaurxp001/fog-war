@@ -25,9 +25,7 @@ typechain-types/
 coverage/
 coverage.json
 
-# Deployment files (may contain sensitive info)
-frontend/src/deployments/*.json
-!frontend/src/deployments/.gitkeep
+
 
 # IDEs and editors
 .vscode/
