@@ -4,12 +4,15 @@ import { useFhevm } from './components/FhevmProvider'
 import { 
     GameState, 
     UnitData,
+    MoveQueueItem,
     getGameState, 
     moveUnit, 
     createUnit, 
     registerPlayer,
     decryptUnitData,
-    batchDecryptCells
+    batchDecryptCells,
+    batchDecryptUnitData,
+    executeMovesQueue,
 } from './utils/gameUtils'
 
 function App() {
@@ -19,6 +22,7 @@ function App() {
     const [selectedUnitId, setSelectedUnitId] = useState<number | null>(null);
     const [selectedCell, setSelectedCell] = useState<{x: number, y: number} | null>(null);
     const [message, setMessage] = useState<string>('');
+    const [moveQueue, setMoveQueue] = useState<MoveQueueItem[]>([]);
 
     useEffect(() => {
         if (isInitialized && account) {
@@ -38,13 +42,9 @@ function App() {
             if (state) {
                 // If decrypt is true, decrypt owned units first, then cells based on unit positions
                 if (decrypt && account) {
-                    // Step 1: Decrypt owned units to get their positions
-                    setMessage("Decrypting unit data...");
-                    for (let i = 0; i < state.units.length; i++) {
-                        if (state.units[i].isOwned) {
-                            state.units[i] = await decryptUnitData(state.units[i], account);
-                        }
-                    }
+                    // Step 1: Batch decrypt all owned units at once (1 signature for all)
+                    setMessage("Decrypting unit data (1 signature for all units)...");
+                    state.units = await batchDecryptUnitData(state.units, account);
                     
                     // Step 2: Now that we know unit positions, fetch and decrypt visible cells
                     setMessage("Decrypting vision (1 signature request for all cells)...");
@@ -302,6 +302,36 @@ function App() {
                             </button>
                         )}
                     </div>
+
+                    {/* Move Queue UI */}
+                    {moveQueue.length > 0 && (
+                        <div style={{ marginBottom: 20, padding: 15, background: '#fff3cd', borderRadius: 5, border: '2px solid #ffc107' }}>
+                            <h3>📋 Move Queue ({moveQueue.length} moves)</h3>
+                            <div style={{ marginBottom: 10, maxHeight: 150, overflowY: 'auto' }}>
+                                {moveQueue.map((move, idx) => (
+                                    <div key={idx} style={{ padding: 5, margin: 2, background: '#fff', borderRadius: 3 }}>
+                                        Move Unit {move.unitId} → ({move.x}, {move.y})
+                                    </div>
+                                ))}
+                            </div>
+                            <div>
+                                <button 
+                                    onClick={handleExecuteQueue}
+                                    disabled={loading}
+                                    style={{ padding: '10px 20px', marginRight: 10, background: '#28a745', color: 'white', border: 'none', borderRadius: 5 }}
+                                >
+                                    ✅ Execute Queue ({moveQueue.length} moves)
+                                </button>
+                                <button 
+                                    onClick={handleClearQueue}
+                                    disabled={loading}
+                                    style={{ padding: '10px 20px', background: '#dc3545', color: 'white', border: 'none', borderRadius: 5 }}
+                                >
+                                    🗑️ Clear Queue
+                                </button>
+                            </div>
+                        </div>
+                    )}
 
                     {gameState && (
                         <>

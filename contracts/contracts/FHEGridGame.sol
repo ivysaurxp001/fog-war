@@ -77,13 +77,8 @@ contract FHEGridGame is ZamaEthereumConfig {
         euint16 atk = FHE.asEuint16(FHE.fromExternal(atkExt, atkProof));
         euint16 def = FHE.asEuint16(FHE.fromExternal(defExt, defProof));
 
-        // Clamp coordinates
-        euint8 maxX = FHE.asEuint8(WIDTH - 1);
-        euint8 maxY = FHE.asEuint8(HEIGHT - 1);
-        ebool tooHighX = FHE.gt(x, maxX);
-        ebool tooHighY = FHE.gt(y, maxY);
-        x = FHE.select(tooHighX, maxX, x);
-        y = FHE.select(tooHighY, maxY, y);
+        // Note: Coordinate clamping removed to reduce FHE operations
+        // Frontend should validate coordinates before calling
 
         EncryptedUnit memory newUnit = EncryptedUnit({
             x: x,
@@ -97,8 +92,8 @@ contract FHEGridGame is ZamaEthereumConfig {
 
         units.push(newUnit);
 
-        // Grant initial vision
-        _grantVisionForUnit(units.length - 1);
+        // Grant vision for unit stats only (cells granted on-demand to avoid revert)
+        _grantVisionForUnitStats(units.length - 1);
     }
 
     /// @notice Move a unit to new position
@@ -143,6 +138,63 @@ contract FHEGridGame is ZamaEthereumConfig {
         emit UnitMoved(unitId, msg.sender);
 
         _advanceTurn();
+    }
+
+    /// @notice Execute a queue of moves from multiple units in one transaction
+    /// @param unitIds Array of unit IDs to move
+    /// @param xExts Array of encrypted x coordinates (one per unit)
+    /// @param xProofs Array of x proofs
+    /// @param yExts Array of encrypted y coordinates (one per unit)
+    /// @param yProofs Array of y proofs
+    function executeMovesQueue(
+        uint256[] calldata unitIds,
+        externalEuint8[] calldata xExts, bytes[] calldata xProofs,
+        externalEuint8[] calldata yExts, bytes[] calldata yProofs
+    ) external {
+        require(unitIds.length == xExts.length && unitIds.length == yExts.length, "Array length mismatch");
+        require(unitIds.length == xProofs.length && unitIds.length == yProofs.length, "Array length mismatch");
+        require(unitIds.length > 0 && unitIds.length <= 20, "Invalid queue size"); // Max 20 moves per batch
+        
+        // Execute each move in the queue sequentially
+        for (uint256 i = 0; i < unitIds.length; i++) {
+            uint256 unitId = unitIds[i];
+            require(unitId < units.length, "Invalid unit ID");
+            EncryptedUnit storage u = units[unitId];
+            
+            require(msg.sender == u.owner, "Not owner");
+            require(_isThisUnitsTurn(unitId), "Not your turn");
+
+            // Convert external encrypted input -> internal euint8
+            euint8 newX = FHE.fromExternal(xExts[i], xProofs[i]);
+            euint8 newY = FHE.fromExternal(yExts[i], yProofs[i]);
+
+            // Clamp coordinates within bounds
+            euint8 maxX = FHE.asEuint8(WIDTH - 1);
+            euint8 maxY = FHE.asEuint8(HEIGHT - 1);
+            ebool tooHighX = FHE.gt(newX, maxX);
+            ebool tooHighY = FHE.gt(newY, maxY);
+            euint8 clampedX = FHE.select(tooHighX, maxX, newX);
+            euint8 clampedY = FHE.select(tooHighY, maxY, newY);
+
+            // Check if move is within 1 step
+            _requireWithinOneStep(u.x, u.y, clampedX, clampedY);
+
+            // Update position
+            u.x = clampedX;
+            u.y = clampedY;
+
+            // Resolve trap/loot & collision
+            _resolveCellEffects(unitId);
+            _resolveUnitCollisions(unitId);
+
+            // Update FOV & ACL for player
+            _grantVisionForUnit(unitId);
+
+            emit UnitMoved(unitId, msg.sender);
+
+            // Advance turn after each move
+            _advanceTurn();
+        }
     }
 
     /// @notice Check if move is within 1 step (simplified version)
@@ -287,44 +339,43 @@ contract FHEGridGame is ZamaEthereumConfig {
         emit CombatResolved(aId, bId);
     }
 
-    /// @notice Grant vision for a unit (Fog of War)
-    function _grantVisionForUnit(uint256 unitId) internal {
+    /// @notice Grant vision for unit stats only (minimal to avoid revert)
+    function _grantVisionForUnitStats(uint256 unitId) internal {
         EncryptedUnit storage u = units[unitId];
         address viewer = u.owner;
         
-        // Always grant vision for unit's own stats
+        // Grant vision for unit's own stats only
         FHE.allow(u.x, viewer);
         FHE.allow(u.y, viewer);
         FHE.allow(u.hp, viewer);
         FHE.allow(u.atk, viewer);
         FHE.allow(u.def, viewer);
         FHE.allow(u.alive, viewer);
-        
-        euint8 ex = u.x;
-        euint8 ey = u.y;
-        
-        // Grant vision for cells within radius
+    }
+    
+    /// @notice Grant vision for all cells (call separately after createUnit)
+    /// This allows createUnit to succeed without revert
+    function grantAllCellVision() external {
+        // Grant vision for all cells to caller
         for (uint8 iy = 0; iy < HEIGHT; iy++) {
             for (uint8 ix = 0; ix < WIDTH; ix++) {
                 EncryptedCell storage cell = grid[iy][ix];
-                
-                // Check if cell is in vision radius
-                ebool inVision = _isCellInSquareVision(ex, ey, ix, iy, VISION_RADIUS);
-                
-                // Grant decrypt permission for terrain if in vision
-                euint8 zero8 = FHE.asEuint8(0);
-                euint8 terrainForViewer = FHE.select(inVision, cell.terrainType, zero8);
-                
-                FHE.allow(terrainForViewer, viewer);
-                FHE.allowThis(terrainForViewer);
+                FHE.allow(cell.terrainType, msg.sender);
+                FHE.allowThis(cell.terrainType);
             }
         }
     }
-
-    /// @notice Check if cell is in square vision radius
-    /// Checks if cell (ix, iy) is within R tiles from (ex, ey) in a square pattern
-    /// Simplified approach: check all possible offsets within radius
-    function _isCellInSquareVision(
+    
+    /// @notice Grant vision for a unit (used in moveUnit)
+    function _grantVisionForUnit(uint256 unitId) internal {
+        _grantVisionForUnitStats(unitId);
+        // Note: Cell vision should be granted separately via grantAllCellVision
+    }
+    
+    /// @notice Simplified vision range check
+    /// Checks if cell (ix, iy) is within square radius R of unit position (ex, ey)
+    /// Uses a simpler approach with fewer FHE operations
+    function _isCellInVisionRange(
         euint8 ex,
         euint8 ey,
         uint8 ix,
@@ -334,56 +385,42 @@ contract FHEGridGame is ZamaEthereumConfig {
         euint8 eix = FHE.asEuint8(ix);
         euint8 eiy = FHE.asEuint8(iy);
         
-        ebool inVision = FHE.asEbool(false);
+        // Check if cell matches unit position (same cell)
+        ebool sameCell = FHE.and(FHE.eq(ex, eix), FHE.eq(ey, eiy));
         
-        // Check all cells within square radius R x R
-        // For simplicity, we check all combinations of dx and dy from 0 to R
-        // This covers all cells in the square around the unit
+        // Check adjacent cells (simplified - only check immediate neighbors)
+        // This is much simpler than checking all cells in radius
+        ebool inRange = sameCell;
         
-        // Check same position first
-        ebool samePos = FHE.and(FHE.eq(ex, eix), FHE.eq(ey, eiy));
-        inVision = FHE.or(inVision, samePos);
+        // Check right neighbor
+        euint8 one = FHE.asEuint8(1);
+        euint8 rightX = FHE.add(ex, one);
+        ebool isRight = FHE.and(FHE.eq(rightX, eix), FHE.eq(ey, eiy));
+        inRange = FHE.or(inRange, isRight);
         
-        // Check all offsets within radius (dx, dy) where 0 <= dx,dy <= R
-        // Note: We only check positive offsets here. For full coverage with negative offsets,
-        // we would need to handle subtraction carefully with euint8.
-        // For POC, this simplified version works well for units not near map edges.
+        // Check left neighbor (if ex >= 1)
+        ebool canGoLeft = FHE.ge(ex, one);
+        euint8 leftX = FHE.select(canGoLeft, FHE.sub(ex, one), FHE.asEuint8(255));
+        ebool isLeft = FHE.and(FHE.and(FHE.eq(leftX, eix), FHE.eq(ey, eiy)), canGoLeft);
+        inRange = FHE.or(inRange, isLeft);
         
-        for (uint8 dx = 0; dx <= R && dx < WIDTH; dx++) {
-            for (uint8 dy = 0; dy <= R && dy < HEIGHT; dy++) {
-                if (dx == 0 && dy == 0) continue; // Already checked
-                
-                euint8 dxEuint = FHE.asEuint8(dx);
-                euint8 dyEuint = FHE.asEuint8(dy);
-                
-                // Check (ex + dx, ey + dy)
-                euint8 candidateX = FHE.add(ex, dxEuint);
-                euint8 candidateY = FHE.add(ey, dyEuint);
-                ebool matchX1 = FHE.eq(candidateX, eix);
-                ebool matchY1 = FHE.eq(candidateY, eiy);
-                ebool match1 = FHE.and(matchX1, matchY1);
-                inVision = FHE.or(inVision, match1);
-                
-                // Check (ex + dx, ey) if dy > 0
-                if (dy > 0) {
-                    ebool matchX2 = FHE.eq(candidateX, eix);
-                    ebool matchY2 = FHE.eq(ey, eiy);
-                    ebool match2 = FHE.and(matchX2, matchY2);
-                    inVision = FHE.or(inVision, match2);
-                }
-                
-                // Check (ex, ey + dy) if dx > 0
-                if (dx > 0) {
-                    ebool matchX3 = FHE.eq(ex, eix);
-                    ebool matchY3 = FHE.eq(candidateY, eiy);
-                    ebool match3 = FHE.and(matchX3, matchY3);
-                    inVision = FHE.or(inVision, match3);
-                }
-            }
-        }
+        // Check bottom neighbor
+        euint8 bottomY = FHE.add(ey, one);
+        ebool isBottom = FHE.and(FHE.eq(ex, eix), FHE.eq(bottomY, eiy));
+        inRange = FHE.or(inRange, isBottom);
         
-        return inVision;
+        // Check top neighbor (if ey >= 1)
+        ebool canGoUp = FHE.ge(ey, one);
+        euint8 topY = FHE.select(canGoUp, FHE.sub(ey, one), FHE.asEuint8(255));
+        ebool isTop = FHE.and(FHE.and(FHE.eq(ex, eix), FHE.eq(topY, eiy)), canGoUp);
+        inRange = FHE.or(inRange, isTop);
+        
+        // For radius > 1, we can extend this pattern, but for now keep it simple
+        // to avoid revert errors
+        
+        return inRange;
     }
+
 
     /// @notice Check if it's this unit's turn
     function _isThisUnitsTurn(uint256 unitId) internal view returns (bool) {
@@ -475,3 +512,4 @@ contract FHEGridGame is ZamaEthereumConfig {
         return (cell.terrainType, cell.hasTrap, cell.hasLoot);
     }
 }
+

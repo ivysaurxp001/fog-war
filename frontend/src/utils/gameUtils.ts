@@ -258,31 +258,143 @@ export const getGameState = async (
 };
 
 /**
+ * Batch decrypt multiple unit data fields at once (optimized - 1 signature for all)
+ */
+export const batchDecryptUnitData = async (
+    units: UnitData[],
+    account: string
+): Promise<UnitData[]> => {
+    try {
+        const instance = await initializeFheInstance();
+        const checksummedContractAddress = getAddress(CONTRACT_ADDRESS);
+        const checksummedUserAddress = getAddress(account);
+
+        // Collect all encrypted handles for batch decrypt
+        const handleContractPairs: Array<{
+            handle: string,
+            contractAddress: string,
+            unitIndex: number,
+            field: 'x' | 'y' | 'hp' | 'atk' | 'def' | 'alive'
+        }> = [];
+
+        // Collect handles from all owned units
+        for (let i = 0; i < units.length; i++) {
+            const unit = units[i];
+            if (!unit.isOwned) continue;
+
+            if (unit._encX) handleContractPairs.push({
+                handle: unit._encX.toString(),
+                contractAddress: checksummedContractAddress,
+                unitIndex: i,
+                field: 'x'
+            });
+            if (unit._encY) handleContractPairs.push({
+                handle: unit._encY.toString(),
+                contractAddress: checksummedContractAddress,
+                unitIndex: i,
+                field: 'y'
+            });
+            if (unit._encHp) handleContractPairs.push({
+                handle: unit._encHp.toString(),
+                contractAddress: checksummedContractAddress,
+                unitIndex: i,
+                field: 'hp'
+            });
+            if (unit._encAtk) handleContractPairs.push({
+                handle: unit._encAtk.toString(),
+                contractAddress: checksummedContractAddress,
+                unitIndex: i,
+                field: 'atk'
+            });
+            if (unit._encDef) handleContractPairs.push({
+                handle: unit._encDef.toString(),
+                contractAddress: checksummedContractAddress,
+                unitIndex: i,
+                field: 'def'
+            });
+            if (unit._encAlive) handleContractPairs.push({
+                handle: unit._encAlive.toString(),
+                contractAddress: checksummedContractAddress,
+                unitIndex: i,
+                field: 'alive'
+            });
+        }
+
+        if (handleContractPairs.length === 0) return units;
+
+        // Single signature request for all decrypts
+        const keypair = instance.generateKeypair();
+        const startTimeStamp = Math.floor(Date.now() / 1000).toString();
+        const durationDays = "10";
+        const contractAddresses = [checksummedContractAddress];
+
+        const eip712 = instance.createEIP712(
+            keypair.publicKey,
+            contractAddresses,
+            startTimeStamp,
+            durationDays
+        );
+
+        const provider = new BrowserProvider(window.ethereum);
+        const signer = await provider.getSigner();
+        const signature = await signer.signTypedData(
+            eip712.domain,
+            { UserDecryptRequestVerification: eip712.types.UserDecryptRequestVerification },
+            eip712.message
+        );
+
+        // Prepare handle pairs for batch decrypt
+        const decryptPairs = handleContractPairs.map(p => ({
+            handle: p.handle,
+            contractAddress: p.contractAddress,
+        }));
+
+        // Batch decrypt all handles at once
+        const decryptResults = await instance.userDecrypt(
+            decryptPairs,
+            keypair.privateKey,
+            keypair.publicKey,
+            signature.replace("0x", ""),
+            contractAddresses,
+            checksummedUserAddress,
+            startTimeStamp,
+            durationDays
+        );
+
+        // Process results and update units
+        const updatedUnits = [...units];
+        for (const pair of handleContractPairs) {
+            const value = decryptResults[pair.handle];
+            const unit = updatedUnits[pair.unitIndex];
+            
+            if (value !== undefined) {
+                if (pair.field === 'x' || pair.field === 'y') {
+                    (unit as any)[pair.field] = Number(value);
+                } else if (pair.field === 'hp' || pair.field === 'atk' || pair.field === 'def') {
+                    (unit as any)[pair.field] = Number(value);
+                } else if (pair.field === 'alive') {
+                    (unit as any)[pair.field] = Number(value) !== 0;
+                }
+            }
+        }
+
+        return updatedUnits;
+    } catch (error) {
+        console.error("Error batch decrypting unit data:", error);
+        return units;
+    }
+};
+
+/**
  * Decrypt unit data on-demand (triggers signature request)
+ * @deprecated Use batchDecryptUnitData for multiple units
  */
 export const decryptUnitData = async (
     unit: UnitData,
     account: string
 ): Promise<UnitData> => {
-    if (!unit.isOwned || !unit._encX) {
-        return unit; // Already decrypted or not owned
-    }
-
-    try {
-        const decrypted: Partial<UnitData> = {};
-        
-        if (unit._encX) decrypted.x = await decryptEuint8(unit._encX, CONTRACT_ADDRESS, account);
-        if (unit._encY) decrypted.y = await decryptEuint8(unit._encY, CONTRACT_ADDRESS, account);
-        if (unit._encHp) decrypted.hp = await decryptEuint16(unit._encHp, CONTRACT_ADDRESS, account);
-        if (unit._encAtk) decrypted.atk = await decryptEuint16(unit._encAtk, CONTRACT_ADDRESS, account);
-        if (unit._encDef) decrypted.def = await decryptEuint16(unit._encDef, CONTRACT_ADDRESS, account);
-        if (unit._encAlive) decrypted.alive = await decryptEbool(unit._encAlive, CONTRACT_ADDRESS, account);
-
-        return { ...unit, ...decrypted };
-    } catch (error) {
-        console.error("Error decrypting unit data:", error);
-        return unit;
-    }
+    const results = await batchDecryptUnitData([unit], account);
+    return results[0] || unit;
 };
 
 /**
@@ -482,6 +594,69 @@ export const moveUnit = async (
         return true;
     } catch (error: any) {
         console.error("Move unit error:", error);
+        throw error;
+    }
+};
+
+/**
+ * Move queue item type
+ */
+export interface MoveQueueItem {
+    unitId: number;
+    x: number;
+    y: number;
+}
+
+/**
+ * Execute a queue of moves from multiple units in one transaction
+ * @param moves Array of {unitId, x, y} moves to execute
+ */
+export const executeMovesQueue = async (
+    moves: MoveQueueItem[],
+    account: string,
+    signer: any
+): Promise<boolean> => {
+    try {
+        if (moves.length === 0) return false;
+        if (moves.length === 1) {
+            // Single move - use regular moveUnit
+            return await moveUnit(moves[0].unitId, moves[0].x, moves[0].y, account, signer);
+        }
+
+        const contract = new Contract(CONTRACT_ADDRESS, ABI, signer);
+
+        // Prepare arrays for batch execution
+        const unitIds: number[] = [];
+        const xExts: bigint[] = [];
+        const yExts: bigint[] = [];
+        const xProofs: string[] = [];
+        const yProofs: string[] = [];
+
+        // Create encrypted inputs for all moves
+        for (const move of moves) {
+            const encX = await createGameEncryptedInput(CONTRACT_ADDRESS, account, move.x);
+            const encY = await createGameEncryptedInput(CONTRACT_ADDRESS, account, move.y);
+            
+            unitIds.push(move.unitId);
+            xExts.push(encX.handles[0]);
+            yExts.push(encY.handles[0]);
+            xProofs.push(encX.inputProof);
+            yProofs.push(encY.inputProof);
+        }
+
+        // Call executeMovesQueue
+        const tx = await contract.executeMovesQueue(
+            unitIds,
+            xExts,
+            xProofs,
+            yExts,
+            yProofs
+        );
+
+        await tx.wait();
+        return true;
+    } catch (error: any) {
+        console.error("Execute moves queue error:", error);
         throw error;
     }
 };

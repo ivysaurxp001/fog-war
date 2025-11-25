@@ -1,5 +1,5 @@
 {
-  "address": "0x22B12fd541Ad1AcB0B6143d3a37c3c0000A8E866",
+  "address": "0xbc10C7F81Dffea04ee4274865F23E2055171b4CC",
   "abi": [
     {
       "inputs": [],
@@ -201,6 +201,39 @@
     {
       "inputs": [
         {
+          "internalType": "uint256[]",
+          "name": "unitIds",
+          "type": "uint256[]"
+        },
+        {
+          "internalType": "externalEuint8[]",
+          "name": "xExts",
+          "type": "bytes32[]"
+        },
+        {
+          "internalType": "bytes[]",
+          "name": "xProofs",
+          "type": "bytes[]"
+        },
+        {
+          "internalType": "externalEuint8[]",
+          "name": "yExts",
+          "type": "bytes32[]"
+        },
+        {
+          "internalType": "bytes[]",
+          "name": "yProofs",
+          "type": "bytes[]"
+        }
+      ],
+      "name": "executeMovesQueue",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
           "internalType": "uint8",
           "name": "x",
           "type": "uint8"
@@ -338,6 +371,13 @@
         }
       ],
       "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "grantAllCellVision",
+      "outputs": [],
+      "stateMutability": "nonpayable",
       "type": "function"
     },
     {
