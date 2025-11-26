@@ -16,12 +16,12 @@ async function main() {
     }
 
     const deployer = signers[0];
-    console.log("Deploying FHEGridGame contract with the account:", deployer.address);
+    console.log("Deploying FHEBattleship contract with the account:", deployer.address);
 
-    const game = await ethers.deployContract("FHEGridGame");
-    await game.waitForDeployment();
+    const battleship = await ethers.deployContract("FHEBattleship");
+    await battleship.waitForDeployment();
 
-    console.log(`FHEGridGame deployed to ${game.target}`);
+    console.log(`FHEBattleship deployed to ${battleship.target}`);
 
     // Save deployment info to frontend
     const deploymentDir = path.join(__dirname, "../../frontend/src/deployments");
@@ -29,14 +29,14 @@ async function main() {
         fs.mkdirSync(deploymentDir, { recursive: true });
     }
 
-    const artifact = await artifacts.readArtifact("FHEGridGame");
+    const artifact = await artifacts.readArtifact("FHEBattleship");
 
     const deploymentData = {
-        address: game.target,
+        address: battleship.target,
         abi: artifact.abi
     };
 
-    const deploymentFile = path.join(deploymentDir, "FHEGridGame.json");
+    const deploymentFile = path.join(deploymentDir, "FHEBattleship.json");
     fs.writeFileSync(deploymentFile, JSON.stringify(deploymentData, null, 2));
     console.log(`Deployment data saved to ${deploymentFile}`);
 }
@@ -47,4 +47,5 @@ main().catch((error) => {
     console.error(error);
     process.exitCode = 1;
 });
+
 

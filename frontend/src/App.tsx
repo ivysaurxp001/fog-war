@@ -1,258 +1,347 @@
 import { useState, useEffect } from 'react'
 import { BrowserProvider } from 'ethers'
 import { useFhevm } from './components/FhevmProvider'
-import { 
-    GameState, 
-    UnitData,
-    MoveQueueItem,
-    getGameState, 
-    moveUnit, 
-    createUnit, 
-    registerPlayer,
-    decryptUnitData,
-    batchDecryptCells,
-    batchDecryptUnitData,
-    executeMovesQueue,
-} from './utils/gameUtils'
+import {
+    createGame,
+    placeShips,
+    shoot,
+    revealBoard,
+    getGame,
+    getShots,
+    decryptHitMiss,
+    getStandardShips,
+    generateSalt,
+    createCommitment,
+    findPlayerGames,
+    GameInfo,
+    ShipPlacement,
+    TOTAL_SEGMENTS,
+    BOARD_WIDTH,
+    BOARD_HEIGHT,
+} from './utils/battleshipUtils'
 
 function App() {
     const { isInitialized, account, connect, error } = useFhevm();
-    const [gameState, setGameState] = useState<GameState | null>(null);
     const [loading, setLoading] = useState(false);
-    const [selectedUnitId, setSelectedUnitId] = useState<number | null>(null);
-    const [selectedCell, setSelectedCell] = useState<{x: number, y: number} | null>(null);
     const [message, setMessage] = useState<string>('');
-    const [moveQueue, setMoveQueue] = useState<MoveQueueItem[]>([]);
+    const [gameId, setGameId] = useState<number | null>(null);
+    const [gameInfo, setGameInfo] = useState<GameInfo | null>(null);
+    const [ships, setShips] = useState<ShipPlacement[]>([]);
+    const [salt, setSalt] = useState<string>('');
+    const [opponent, setOpponent] = useState<string>('');
+    const [shots, setShots] = useState<any[]>([]);
+    const [selectedCell, setSelectedCell] = useState<{x: number, y: number} | null>(null);
+    const [playerGames, setPlayerGames] = useState<Array<{gameId: number, game: GameInfo}>>([]);
+    const [loadingGames, setLoadingGames] = useState(false);
+
+    useEffect(() => {
+        if (isInitialized && account && gameId !== null) {
+            refreshGame();
+        }
+    }, [isInitialized, account, gameId]);
+
+    // Auto-refresh game state periodically when in Playing phase
+    useEffect(() => {
+        if (!gameInfo || gameInfo.phase !== 2 || !gameId) return; // Only in Playing phase
+        
+        const interval = setInterval(() => {
+            refreshGame();
+        }, 5000); // Refresh every 5 seconds
+        
+        return () => clearInterval(interval);
+    }, [gameInfo?.phase, gameId]);
 
     useEffect(() => {
         if (isInitialized && account) {
-            refreshGameState();
+            loadPlayerGames();
+        } else {
+            setPlayerGames([]);
+            setGameId(null);
         }
     }, [isInitialized, account]);
 
-    const refreshGameState = async (decrypt = false) => {
+    const loadPlayerGames = async () => {
         if (!window.ethereum || !account) return;
+        setLoadingGames(true);
         try {
-            setLoading(true);
-            setMessage(decrypt ? "Loading and decrypting game state (signature required)..." : "Loading game state...");
-            
             const provider = new BrowserProvider(window.ethereum);
-            const state = await getGameState(account, provider);
+            const games = await findPlayerGames(account, provider);
+            setPlayerGames(games);
             
-            if (state) {
-                // If decrypt is true, decrypt owned units first, then cells based on unit positions
-                if (decrypt && account) {
-                    // Step 1: Batch decrypt all owned units at once (1 signature for all)
-                    setMessage("Decrypting unit data (1 signature for all units)...");
-                    state.units = await batchDecryptUnitData(state.units, account);
-                    
-                    // Step 2: Now that we know unit positions, fetch and decrypt visible cells
-                    setMessage("Decrypting vision (1 signature request for all cells)...");
-                    const cellsToDecrypt: {x: number, y: number}[] = [];
-                    const decryptedCells = new Set<string>();
-                    
-                    for (const unitId of state.myUnits) {
-                        const unit = state.units[unitId];
-                        if (unit.x !== null && unit.y !== null) {
-                            // Collect cells around unit (vision radius 2) - avoid duplicates
-                            for (let y = Math.max(0, unit.y - 2); y <= Math.min(7, unit.y + 2); y++) {
-                                for (let x = Math.max(0, unit.x - 2); x <= Math.min(7, unit.x + 2); x++) {
-                                    const key = `${x},${y}`;
-                                    if (!decryptedCells.has(key)) {
-                                        cellsToDecrypt.push({x, y});
-                                        decryptedCells.add(key);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Batch decrypt all cells with ONE signature request
-                    if (cellsToDecrypt.length > 0) {
-                        const decryptedCellsMap = await batchDecryptCells(cellsToDecrypt, account, provider);
-                        for (const [key, cell] of decryptedCellsMap.entries()) {
-                            const [x, y] = key.split(',').map(Number);
-                            state.grid[y][x] = cell;
-                        }
-                    }
-                    
-                    setMessage("Game state loaded successfully!");
-                } else {
-                    setMessage("Game state loaded (click 'Load & Decrypt Vision' to see encrypted data)");
-                }
-                
-                setGameState(state);
+            // Auto-load first game if available
+            if (games.length > 0 && gameId === null) {
+                setGameId(games[0].gameId);
+                setGameInfo(games[0].game);
             }
         } catch (error: any) {
-            console.error("Error fetching game state:", error);
-            setMessage("Error: " + (error.message || "Unknown error"));
+            console.error("Load player games error:", error);
+        } finally {
+            setLoadingGames(false);
+        }
+    };
+
+    const refreshGame = async () => {
+        if (!window.ethereum || !account || gameId === null) return;
+        try {
+            const provider = new BrowserProvider(window.ethereum);
+            
+            // Wait a bit for blockchain state to update
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            const game = await getGame(gameId, provider);
+            console.log("Refreshed game state:", { 
+                phase: game.phase, 
+                turn: game.turn, 
+                shotCount: game.shotCount,
+                currentAccount: account 
+            });
+            setGameInfo(game);
+            
+            const gameShots = await getShots(gameId, provider);
+            setShots(gameShots);
+            
+            // Refresh games list
+            await loadPlayerGames();
+        } catch (error: any) {
+            console.error("Refresh game error:", error);
+        }
+    };
+
+    const handleSelectGame = (selectedGameId: number) => {
+        setGameId(selectedGameId);
+        const selectedGame = playerGames.find(g => g.gameId === selectedGameId);
+        if (selectedGame) {
+            setGameInfo(selectedGame.game);
+        }
+    };
+
+    const handleCreateGame = async () => {
+        if (!window.ethereum || !account) {
+            setMessage("Please connect wallet");
+            return;
+        }
+        // If no opponent specified, create game with self (for testing)
+        const opponentAddress = opponent || account;
+        setLoading(true);
+        try {
+            const provider = new BrowserProvider(window.ethereum);
+            const signer = await provider.getSigner();
+            const newGameId = await createGame(opponentAddress, signer);
+            setGameId(newGameId);
+            if (opponentAddress.toLowerCase() === account.toLowerCase()) {
+                setMessage(`Game ${newGameId} created (self-play mode for testing)! You can play both sides.`);
+            } else {
+                setMessage(`Game ${newGameId} created! Both players need to place ships.`);
+            }
+            await loadPlayerGames();
+        } catch (error: any) {
+            console.error("Create game error:", error);
+            setMessage("Failed to create game: " + error.message);
         } finally {
             setLoading(false);
         }
     };
 
-    const handleRegisterPlayer = async () => {
-        if (!window.ethereum || !account) return;
+    const handlePlaceShips = async () => {
+        if (!window.ethereum || !account || gameId === null) {
+            setMessage("Please connect wallet and create/join a game first");
+            return;
+        }
+        if (ships.length !== TOTAL_SEGMENTS) {
+            setMessage(`Please place exactly ${TOTAL_SEGMENTS} ship segments (currently ${ships.length})`);
+            return;
+        }
         setLoading(true);
+        setMessage("Packing coordinates and encrypting (this may take a moment)...");
         try {
             const provider = new BrowserProvider(window.ethereum);
             const signer = await provider.getSigner();
-            await registerPlayer(signer);
-            setMessage("Successfully registered!");
-            await refreshGameState();
+            const newSalt = salt || generateSalt();
+            setSalt(newSalt);
+            
+            console.log("Placing ships:", { gameId, shipsCount: ships.length, salt: newSalt });
+            setMessage("Encrypting ship coordinates (1 signature request for all 34 coordinates)...");
+            
+            await placeShips(gameId, ships, newSalt, account, signer);
+            
+            setMessage("✅ Ships placed successfully! Waiting for opponent to place their ships...");
+            await refreshGame();
         } catch (error: any) {
-            console.error("Register error:", error);
-            setMessage("Registration failed: " + error.message);
+            console.error("Place ships error:", error);
+            const errorMsg = error.message || error.toString() || "Unknown error";
+            setMessage(`❌ Failed to place ships: ${errorMsg}`);
+            // Show more details in console
+            if (error.data) {
+                console.error("Error data:", error.data);
+            }
+            if (error.reason) {
+                console.error("Error reason:", error.reason);
+            }
         } finally {
             setLoading(false);
         }
     };
 
-    const handleCreateUnit = async () => {
-        if (!window.ethereum || !account || !selectedCell) return;
+    const handleShoot = async (x: number, y: number) => {
+        if (!window.ethereum || !account || gameId === null) return;
+        
+        // Re-check turn right before shooting (in case state changed)
+        const provider = new BrowserProvider(window.ethereum);
+        const currentGame = await getGame(gameId, provider);
+        if (currentGame.turn.toLowerCase() !== account.toLowerCase()) {
+            const turnPlayer = currentGame.turn.toLowerCase() === currentGame.p1.toLowerCase() ? 'Player 1' : 'Player 2';
+            setMessage(`⏳ Not your turn! It's ${turnPlayer}'s turn (${currentGame.turn.slice(0, 6)}...${currentGame.turn.slice(-4)})`);
+            // Update gameInfo to reflect current state
+            setGameInfo(currentGame);
+            return;
+        }
+        
         setLoading(true);
         try {
-            const provider = new BrowserProvider(window.ethereum);
             const signer = await provider.getSigner();
-            await createUnit(
-                selectedCell.x,
-                selectedCell.y,
-                50, // HP
-                10, // ATK
-                5,  // DEF
-                account,
-                signer
-            );
-            setMessage("Unit created!");
-            await refreshGameState();
-            setSelectedCell(null);
+            
+            setMessage(`🎯 Shooting at (${x}, ${y})...`);
+            const hitCipher = await shoot(gameId, x, y, signer);
+            
+            setMessage(`✅ Shot fired! Decrypting result...`);
+            
+            // Decrypt hit/miss
+            const isHit = await decryptHitMiss(hitCipher, account);
+            setMessage(`🎯 Shot at (${x}, ${y}): ${isHit ? 'HIT! 🎯' : 'MISS 💨'}. Refreshing game state...`);
+            
+            // Wait for transaction to be fully processed
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Refresh game state to update turn
+            await refreshGame();
+            
+            // Double check turn after refresh
+            const updatedGame = await getGame(gameId, provider);
+            const newTurn = updatedGame.turn.toLowerCase();
+            const currentAccount = account.toLowerCase();
+            
+            if (newTurn !== currentAccount) {
+                const nextPlayer = newTurn === updatedGame.p1.toLowerCase() ? 'Player 1' : 'Player 2';
+                setMessage(`✅ Turn switched! It's now ${nextPlayer}'s turn (${updatedGame.turn.slice(0, 6)}...${updatedGame.turn.slice(-4)}). You can click "Refresh Game" if needed.`);
+            } else {
+                setMessage(`⚠️ Turn didn't switch. This might be a bug. Please refresh manually.`);
+            }
         } catch (error: any) {
-            console.error("Create unit error:", error);
-            setMessage("Failed to create unit: " + error.message);
+            console.error("Shoot error:", error);
+            setMessage("❌ Failed to shoot: " + error.message);
+            // Refresh anyway to get latest state
+            await refreshGame();
         } finally {
             setLoading(false);
         }
     };
 
-    const handleMoveUnit = async (unitId: number, newX: number, newY: number) => {
-        if (!window.ethereum || !account) return;
+    const handleRevealBoard = async () => {
+        if (!window.ethereum || !account || gameId === null) return;
+        if (ships.length !== TOTAL_SEGMENTS || !salt) {
+            setMessage("Please place ships first");
+            return;
+        }
         setLoading(true);
         try {
             const provider = new BrowserProvider(window.ethereum);
             const signer = await provider.getSigner();
-            await moveUnit(unitId, newX, newY, account, signer);
-            setMessage("Unit moved!");
-            await refreshGameState();
-            setSelectedUnitId(null);
-            setSelectedCell(null);
+            await revealBoard(gameId, ships, salt, signer);
+            setMessage("Board revealed! Waiting for opponent...");
+            await refreshGame();
         } catch (error: any) {
-            console.error("Move error:", error);
-            setMessage("Move failed: " + error.message);
+            console.error("Reveal board error:", error);
+            setMessage("Failed to reveal board: " + error.message);
         } finally {
             setLoading(false);
         }
+    };
+
+    const handleUseStandardShips = () => {
+        const standard = getStandardShips();
+        setShips(standard);
+        setMessage(`Loaded standard ship configuration (${standard.length} segments)`);
     };
 
     const handleCellClick = (x: number, y: number) => {
-        if (!gameState) return;
-
-        // If no units exist, allow cell selection for unit creation
-        if (gameState.units.length === 0 || gameState.myUnits.length === 0) {
-            setSelectedCell({ x, y });
-            setMessage(`Selected cell (${x}, ${y}) for unit creation. Click "Create Unit" button.`);
-            return;
-        }
-
-        // Check if this is a unit's turn
-        const currentUnit = gameState.units[gameState.currentUnitTurn];
-        if (!currentUnit || !currentUnit.isOwned) {
-            if (gameState.myUnits.length > 0) {
-                setMessage("Not your turn! Wait for your unit's turn to move.");
+        if (!gameInfo) return;
+        
+        // If placing ships, add/remove segment
+        if (gameInfo.phase === 1) { // Placing phase
+            const existingIndex = ships.findIndex(s => s.x === x && s.y === y);
+            if (existingIndex >= 0) {
+                // Remove segment
+                setShips(ships.filter((_, i) => i !== existingIndex));
+                setMessage(`Removed segment at (${x}, ${y}). ${ships.length - 1}/${TOTAL_SEGMENTS} segments`);
             } else {
-                setMessage("You don't have any units. Create a unit first!");
-            }
-            return;
-        }
-
-        // If unit selected, try to move
-        if (selectedUnitId !== null) {
-            const unit = gameState.units[selectedUnitId];
-            if (unit && unit.isOwned && unit.x !== null && unit.y !== null) {
-                // Check if move is within 1 tile
-                const dx = Math.abs(x - unit.x);
-                const dy = Math.abs(y - unit.y);
-                if (dx + dy <= 1) {
-                    handleMoveUnit(selectedUnitId, x, y);
-                } else {
-                    setMessage("Can only move 1 tile at a time!");
+                // Add segment
+                if (ships.length >= TOTAL_SEGMENTS) {
+                    setMessage(`Maximum ${TOTAL_SEGMENTS} segments allowed`);
+                    return;
                 }
+                setShips([...ships, { x, y }]);
+                setMessage(`Added segment at (${x}, ${y}). ${ships.length + 1}/${TOTAL_SEGMENTS} segments`);
             }
-        } else {
-            // Select cell for unit creation or selection
+        } else if (gameInfo.phase === 2 && gameInfo.turn.toLowerCase() === account?.toLowerCase()) {
+            // Playing phase - shoot
             setSelectedCell({ x, y });
-            if (gameState.myUnits.length === 0) {
-                setMessage(`Selected cell (${x}, ${y}) for unit creation.`);
+            handleShoot(x, y);
+        }
+    };
+
+    const renderBoard = (isOpponent: boolean = false) => {
+        const board: JSX.Element[] = [];
+        for (let y = 0; y < BOARD_HEIGHT; y++) {
+            for (let x = 0; x < BOARD_WIDTH; x++) {
+                const cellKey = `${x}-${y}`;
+                const isShip = ships.some(s => s.x === x && s.y === y);
+                const shot = shots.find(s => s.x === x && s.y === y);
+                const isMyShot = shot && shot.shooter.toLowerCase() === account?.toLowerCase();
+                
+                let cellContent = '';
+                let cellColor = '#87CEEB'; // Sky blue (water)
+                
+                if (isShip && !isOpponent) {
+                    cellColor = '#8B4513'; // Brown (ship)
+                }
+                
+                if (shot) {
+                    if (isMyShot) {
+                        // Show hit/miss for my shots (would need to decrypt)
+                        cellContent = '?'; // Placeholder - would show HIT/MISS after decrypt
+                    } else {
+                        cellContent = '💥'; // Opponent's shot
+                    }
+                }
+                
+                board.push(
+                    <div
+                        key={cellKey}
+                        onClick={() => handleCellClick(x, y)}
+                        style={{
+                            width: 30,
+                            height: 30,
+                            background: cellColor,
+                            border: '1px solid #333',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '16px',
+                        }}
+                        title={`Cell (${x}, ${y})`}
+                    >
+                        {cellContent}
+                    </div>
+                );
             }
         }
-    };
-
-    const handleUnitSelect = (unitId: number) => {
-        if (!gameState) return;
-        const unit = gameState.units[unitId];
-        if (unit && unit.isOwned && gameState.currentUnitTurn === unitId) {
-            setSelectedUnitId(unitId);
-            setMessage(`Selected unit ${unitId} for movement`);
-        } else {
-            setMessage("Cannot select this unit (not your turn or not owned)");
-        }
-    };
-
-    const getCellColor = (cell: {terrainType: number | null, hasTrap: boolean | null, hasLoot: boolean | null}) => {
-        if (cell.terrainType === null) return '#333'; // Fog of war
-        if (cell.terrainType === 0) return '#8B4513'; // Plain
-        if (cell.terrainType === 1) return '#228B22'; // Forest
-        if (cell.terrainType === 2) return '#696969'; // Wall
-        return '#DDD';
-    };
-
-    const getCellContent = (x: number, y: number) => {
-        if (!gameState) return null;
-        
-        // Check for units at this position
-        const unit = gameState.units.find(u => u.x === x && u.y === y && u.alive);
-        if (unit) {
-            const isMyUnit = unit.isOwned;
-            const isCurrentTurn = gameState.currentUnitTurn === unit.id;
-            return (
-                <div style={{
-                    width: '100%',
-                    height: '100%',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '20px',
-                    fontWeight: 'bold',
-                    color: isMyUnit ? '#FFD700' : '#FF0000',
-                    border: isCurrentTurn ? '2px solid #00FF00' : 'none',
-                    borderRadius: '50%',
-                    background: isMyUnit ? 'rgba(255, 215, 0, 0.3)' : 'rgba(255, 0, 0, 0.3)',
-                }}>
-                    {unit.id}
-                </div>
-            );
-        }
-        
-        // Check for trap/loot
-        const cell = gameState.grid[y][x];
-        if (cell.hasTrap) return '⚠️';
-        if (cell.hasLoot) return '💰';
-        
-        return null;
+        return board;
     };
 
     return (
         <div style={{ padding: 20, maxWidth: 1200, margin: '0 auto' }}>
-            <h1>Fog-of-War Grid Tactics</h1>
+            <h1>🔫 FHE Battleship</h1>
             
             <div style={{ marginBottom: 20 }}>
                 <p><strong>Account:</strong> {account || "Not connected"}</p>
@@ -269,182 +358,164 @@ function App() {
 
             {isInitialized && account && (
                 <>
-                    <div style={{ marginBottom: 20 }}>
-                        <button 
-                            onClick={handleRegisterPlayer}
-                            disabled={loading}
-                            style={{ padding: '10px 20px', marginRight: 10 }}
-                        >
-                            Register Player
-                        </button>
-                        <button 
-                            onClick={() => refreshGameState(false)}
-                            disabled={loading}
-                            style={{ padding: '10px 20px', marginRight: 10 }}
-                        >
-                            Refresh Game State
-                        </button>
-                        <button 
-                            onClick={() => refreshGameState(true)}
-                            disabled={loading}
-                            style={{ padding: '10px 20px', marginRight: 10 }}
-                            title="This will request signature to decrypt your data"
-                        >
-                            🔐 Load & Decrypt Vision
-                        </button>
-                        {selectedCell && (
-                            <button 
-                                onClick={handleCreateUnit}
-                                disabled={loading}
-                                style={{ padding: '10px 20px' }}
-                            >
-                                Create Unit at ({selectedCell.x}, {selectedCell.y})
-                            </button>
-                        )}
-                    </div>
-
-                    {/* Move Queue UI */}
-                    {moveQueue.length > 0 && (
-                        <div style={{ marginBottom: 20, padding: 15, background: '#fff3cd', borderRadius: 5, border: '2px solid #ffc107' }}>
-                            <h3>📋 Move Queue ({moveQueue.length} moves)</h3>
-                            <div style={{ marginBottom: 10, maxHeight: 150, overflowY: 'auto' }}>
-                                {moveQueue.map((move, idx) => (
-                                    <div key={idx} style={{ padding: 5, margin: 2, background: '#fff', borderRadius: 3 }}>
-                                        Move Unit {move.unitId} → ({move.x}, {move.y})
+                    {/* My Games List */}
+                    <div style={{ marginBottom: 20, padding: 15, background: '#e7f3ff', borderRadius: 5 }}>
+                        <h3>My Games</h3>
+                        {loadingGames ? (
+                            <p>Loading games...</p>
+                        ) : playerGames.length > 0 ? (
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                                {playerGames.map(({ gameId: gId, game }) => (
+                                    <div
+                                        key={gId}
+                                        onClick={() => handleSelectGame(gId)}
+                                        style={{
+                                            padding: 10,
+                                            border: gId === gameId ? '3px solid #00FF00' : '2px solid #333',
+                                            borderRadius: 5,
+                                            background: gId === gameId ? '#fff' : '#f5f5f5',
+                                            cursor: 'pointer',
+                                            minWidth: 200,
+                                        }}
+                                    >
+                                        <p><strong>Game #{gId}</strong></p>
+                                        <p>P1: {game.p1.slice(0, 6)}...{game.p1.slice(-4)}</p>
+                                        <p>P2: {game.p2.slice(0, 6)}...{game.p2.slice(-4)}</p>
+                                        <p>Phase: {['Waiting', 'Placing', 'Playing', 'Reveal', 'Finished'][game.phase]}</p>
+                                        <p>Shots: {game.shotCount}</p>
+                                        {game.winner !== '0x0000000000000000000000000000000000000000' && (
+                                            <p><strong>Winner: {game.winner.slice(0, 6)}...{game.winner.slice(-4)}</strong></p>
+                                        )}
                                     </div>
                                 ))}
                             </div>
-                            <div>
-                                <button 
-                                    onClick={handleExecuteQueue}
+                        ) : (
+                            <p>No games found. Create a new game below.</p>
+                        )}
+                        <button
+                            onClick={loadPlayerGames}
+                            disabled={loadingGames}
+                            style={{ padding: '10px 20px', marginTop: 10 }}
+                        >
+                            🔄 Refresh Games
+                        </button>
+                    </div>
+
+                    {/* Game Setup */}
+                    <div style={{ marginBottom: 20, padding: 15, background: '#f0f0f0', borderRadius: 5 }}>
+                        <h3>Create New Game</h3>
+                        <input
+                            type="text"
+                            placeholder="Opponent address (leave empty for self-play/test)"
+                            value={opponent}
+                            onChange={(e) => setOpponent(e.target.value)}
+                            style={{ padding: '10px', width: '400px', marginRight: 10 }}
+                        />
+                        <button
+                            onClick={handleCreateGame}
+                            disabled={loading}
+                            style={{ padding: '10px 20px', marginRight: 10 }}
+                        >
+                            Create Game
+                        </button>
+                        <button
+                            onClick={() => {
+                                setOpponent(account || '');
+                                setMessage("Opponent set to your address (self-play mode)");
+                            }}
+                            style={{ padding: '10px 20px', background: '#17a2b8', color: 'white', border: 'none', borderRadius: 5 }}
+                            title="Create game with yourself for testing"
+                        >
+                            🧪 Self-Play (Test)
+                        </button>
+                        <p style={{ marginTop: 10, fontSize: '12px', color: '#666' }}>
+                            💡 Tip: Leave opponent empty or click "Self-Play" to test with 1 wallet. For real game, enter opponent's address.
+                        </p>
+                    </div>
+
+                    {/* Game Info */}
+                    {gameInfo && (
+                        <div style={{ marginBottom: 20, padding: 15, background: '#f0f0f0', borderRadius: 5 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                                <h3 style={{ margin: 0 }}>Game #{gameId}</h3>
+                                <button
+                                    onClick={refreshGame}
                                     disabled={loading}
-                                    style={{ padding: '10px 20px', marginRight: 10, background: '#28a745', color: 'white', border: 'none', borderRadius: 5 }}
+                                    style={{ padding: '5px 15px', background: '#17a2b8', color: 'white', border: 'none', borderRadius: 5, cursor: loading ? 'not-allowed' : 'pointer' }}
+                                    title="Refresh game state"
                                 >
-                                    ✅ Execute Queue ({moveQueue.length} moves)
+                                    🔄 Refresh
                                 </button>
-                                <button 
-                                    onClick={handleClearQueue}
-                                    disabled={loading}
-                                    style={{ padding: '10px 20px', background: '#dc3545', color: 'white', border: 'none', borderRadius: 5 }}
-                                >
-                                    🗑️ Clear Queue
-                                </button>
+                            </div>
+                            <p><strong>Phase:</strong> {['Waiting', 'Placing', 'Playing', 'Reveal', 'Finished'][gameInfo.phase]}</p>
+                            <p><strong>Player 1:</strong> {gameInfo.p1.slice(0, 6)}...{gameInfo.p1.slice(-4)} {gameInfo.p1.toLowerCase() === account?.toLowerCase() && <span style={{ color: 'green' }}>(You)</span>}</p>
+                            <p><strong>Player 2:</strong> {gameInfo.p2.slice(0, 6)}...{gameInfo.p2.slice(-4)} {gameInfo.p2.toLowerCase() === account?.toLowerCase() && <span style={{ color: 'green' }}>(You)</span>}</p>
+                            <p>
+                                <strong>Current Turn:</strong> {gameInfo.turn.slice(0, 6)}...{gameInfo.turn.slice(-4)}
+                                {gameInfo.turn.toLowerCase() === account?.toLowerCase() && (
+                                    <span style={{ color: 'green', fontWeight: 'bold', marginLeft: 10 }}>✓ Your Turn!</span>
+                                )}
+                                {gameInfo.turn.toLowerCase() !== account?.toLowerCase() && gameInfo.phase === 2 && (
+                                    <span style={{ color: 'orange', marginLeft: 10 }}>⏳ Waiting for opponent...</span>
+                                )}
+                            </p>
+                            <p><strong>Shots:</strong> {gameInfo.shotCount}</p>
+                            {gameInfo.winner !== '0x0000000000000000000000000000000000000000' && (
+                                <p><strong>Winner:</strong> {gameInfo.winner}</p>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Ship Placement */}
+                    {gameInfo && gameInfo.phase === 1 && (
+                        <div style={{ marginBottom: 20, padding: 15, background: '#fff3cd', borderRadius: 5 }}>
+                            <h3>Place Your Ships ({ships.length}/{TOTAL_SEGMENTS} segments)</h3>
+                            <p>Click cells to place ship segments. Click again to remove.</p>
+                            <button
+                                onClick={handleUseStandardShips}
+                                style={{ padding: '10px 20px', marginRight: 10, marginBottom: 10 }}
+                            >
+                                Use Standard Ships
+                            </button>
+                            <button
+                                onClick={handlePlaceShips}
+                                disabled={loading || ships.length !== TOTAL_SEGMENTS}
+                                style={{ padding: '10px 20px', background: '#28a745', color: 'white', border: 'none', borderRadius: 5 }}
+                            >
+                                Place Ships
+                            </button>
+                        </div>
+                    )}
+
+                    {/* Game Board */}
+                    {gameInfo && (
+                        <div style={{ marginBottom: 20 }}>
+                            <h3>Your Board (10x10)</h3>
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: `repeat(${BOARD_WIDTH}, 1fr)`,
+                                gap: 2,
+                                width: 'fit-content',
+                                border: '2px solid #000',
+                                padding: 5,
+                                background: '#000'
+                            }}>
+                                {renderBoard(false)}
                             </div>
                         </div>
                     )}
 
-                    {gameState && (
-                        <>
-                            <div style={{ marginBottom: 20, padding: 10, background: '#f0f0f0', borderRadius: 5 }}>
-                                <h3>Game Info</h3>
-                                <p><strong>Round:</strong> {gameState.currentRound}</p>
-                                {gameState.units.length > 0 ? (
-                                    <>
-                                        <p><strong>Current Turn:</strong> Unit {gameState.currentUnitTurn}</p>
-                                        <p><strong>Total Units:</strong> {gameState.units.length}</p>
-                                    </>
-                                ) : (
-                                    <p style={{ color: '#666', fontStyle: 'italic' }}>No units in game yet. Create your first unit!</p>
-                                )}
-                                <p><strong>Your Units:</strong> {gameState.myUnits.length > 0 ? gameState.myUnits.join(', ') : 'None - Create one to start playing!'}</p>
-                                {gameState.myUnits.length === 0 && (
-                                    <p style={{ color: '#ff6b00', fontWeight: 'bold', marginTop: 10 }}>
-                                        💡 Tip: Click a cell on the grid, then click "Create Unit" button above
-                                    </p>
-                                )}
-                            </div>
-
-                            {/* Game Grid */}
-                            <div style={{ marginBottom: 20 }}>
-                                <h3>Game Grid (8x8)</h3>
-                                <div style={{
-                                    display: 'grid',
-                                    gridTemplateColumns: 'repeat(8, 1fr)',
-                                    gap: 2,
-                                    width: '640px',
-                                    margin: '0 auto',
-                                    border: '2px solid #000',
-                                    padding: 5,
-                                    background: '#000'
-                                }}>
-                                    {gameState.grid.map((row, y) =>
-                                        row.map((cell, x) => (
-                                            <div
-                                                key={`${x}-${y}`}
-                                                onClick={() => handleCellClick(x, y)}
-                                                style={{
-                                                    width: 70,
-                                                    height: 70,
-                                                    background: getCellColor(cell),
-                                                    border: selectedCell?.x === x && selectedCell?.y === y 
-                                                        ? '3px solid #00FF00' 
-                                                        : '1px solid #555',
-                                                    cursor: 'pointer',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    justifyContent: 'center',
-                                                    position: 'relative',
-                                                }}
-                                                title={`Cell (${x}, ${y})`}
-                                            >
-                                                {getCellContent(x, y)}
-                                                {cell.terrainType === null && (
-                                                    <span style={{ fontSize: '12px', color: '#666' }}>?</span>
-                                                )}
-                                            </div>
-                                        ))
-                                    )}
-                                </div>
-                            </div>
-
-                            {/* Units List */}
-                            <div style={{ marginTop: 20 }}>
-                                <h3>Units</h3>
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-                                    {gameState.units.map((unit) => (
-                                        <div
-                                            key={unit.id}
-                                            onClick={() => handleUnitSelect(unit.id)}
-                                            style={{
-                                                padding: 10,
-                                                border: selectedUnitId === unit.id 
-                                                    ? '3px solid #00FF00' 
-                                                    : unit.isOwned 
-                                                        ? '2px solid #FFD700' 
-                                                        : '1px solid #CCC',
-                                                borderRadius: 5,
-                                                background: unit.isOwned ? '#FFFACD' : '#F5F5F5',
-                                                cursor: unit.isOwned && gameState.currentUnitTurn === unit.id ? 'pointer' : 'default',
-                                                minWidth: 150,
-                                            }}
-                                        >
-                                            <p><strong>Unit {unit.id}</strong></p>
-                                            <p>Owner: {unit.owner.slice(0, 6)}...{unit.owner.slice(-4)}</p>
-                                            {unit.x !== null && unit.y !== null && (
-                                                <p>Position: ({unit.x}, {unit.y})</p>
-                                            )}
-                                            {unit.hp !== null && (
-                                                <p>HP: {unit.hp}</p>
-                                            )}
-                                            {unit.alive !== null && (
-                                                <p>Alive: {unit.alive ? '✅' : '❌'}</p>
-                                            )}
-                                            {gameState.currentUnitTurn === unit.id && (
-                                                <p style={{ color: 'green', fontWeight: 'bold' }}>Current Turn</p>
-                                            )}
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-
-                            {/* Legend */}
-                            <div style={{ marginTop: 20, padding: 10, background: '#f0f0f0', borderRadius: 5 }}>
-                                <h4>Legend</h4>
-                                <p>🟫 Plain | 🟩 Forest | ⬛ Wall | ⬜ Fog of War (Unknown)</p>
-                                <p>⚠️ Trap | 💰 Loot | 🟡 Your Unit | 🔴 Enemy Unit</p>
-                                <p>Click a cell to select, then click adjacent cell to move (1 tile max)</p>
-                            </div>
-                        </>
+                    {/* Reveal Button */}
+                    {gameInfo && gameInfo.phase === 3 && (
+                        <div style={{ marginBottom: 20 }}>
+                            <button
+                                onClick={handleRevealBoard}
+                                disabled={loading}
+                                style={{ padding: '10px 20px', background: '#17a2b8', color: 'white', border: 'none', borderRadius: 5 }}
+                            >
+                                Reveal Board
+                            </button>
+                        </div>
                     )}
 
                     {loading && (
